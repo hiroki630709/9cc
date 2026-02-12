@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                                  GoldTrendEA.mq5 |
 //|                        Gold Trend Following EA for Exness MT5     |
-//|                        XAUUSD M15 - Dynamic Risk Management       |
+//|                        XAUUSD H1 - Compound Risk Management       |
 //+------------------------------------------------------------------+
 #property copyright "GoldTrendEA"
-#property version   "2.00"
+#property version   "3.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -13,6 +13,9 @@
 //| Input Parameters                                                  |
 //+------------------------------------------------------------------+
 
+//--- シグナル時間軸（H1推奨）
+input ENUM_TIMEFRAMES SignalTF = PERIOD_H1;   // シグナル判定の時間軸
+
 //--- トレンド検出パラメータ
 input int      FastEMA_Period    = 20;         // 短期EMA期間
 input int      SlowEMA_Period    = 50;         // 長期EMA期間
@@ -20,20 +23,20 @@ input int      TrendEMA_Period   = 200;        // 長期トレンド判定EMA
 
 //--- ADXトレンド強度フィルター
 input int      ADX_Period        = 14;         // ADX期間
-input double   ADX_MinLevel      = 20.0;       // ADX最低値（トレンド強度フィルター）
+input double   ADX_MinLevel      = 25.0;       // ADX最低値（25で強めフィルター）
 
 //--- RSIフィルター
 input int      RSI_Period        = 14;         // RSI期間
-input double   RSI_BuyMax        = 70.0;       // RSI買い上限（過買い回避）
-input double   RSI_SellMin       = 30.0;       // RSI売り下限（過売り回避）
+input double   RSI_BuyMax        = 65.0;       // RSI買い上限（過買い回避）
+input double   RSI_SellMin       = 35.0;       // RSI売り下限（過売り回避）
 
 //--- ATRベース損切り・利確
 input int      ATR_Period        = 14;         // ATR期間
-input double   ATR_SL_Multi     = 2.0;        // SL = ATR × この倍率（広めに設定）
-input double   RR_Ratio          = 2.0;        // リスクリワード比（TP = SL × この値）
+input double   ATR_SL_Multi     = 2.0;        // SL = ATR × この倍率
+input double   RR_Ratio          = 2.5;        // リスクリワード比（TP = SL × この値）
 
-//--- リスク管理（段階的）
-input double   Risk_Level1       = 10.0;       // 残高3万円未満: リスク%
+//--- リスク管理（段階的・複利対応）
+input double   Risk_Level1       = 8.0;        // 残高3万円未満: リスク%
 input double   Risk_Level2       = 5.0;        // 残高3万〜10万円: リスク%
 input double   Risk_Level3       = 3.0;        // 残高10万〜30万円: リスク%
 input double   Risk_Level4       = 2.0;        // 残高30万円以上: リスク%
@@ -45,18 +48,21 @@ input double   Balance_Thresh4   = 300000.0;   // レベル4閾値（円）
 input double   MinLot            = 0.01;       // 最小ロット
 input double   MaxLot            = 10.0;       // 最大ロット
 
-//--- トレーリングストップ
-input bool     UseTrailingStop   = true;       // トレーリングストップ使用
+//--- ブレイクイーブン＆トレーリングストップ
+input bool     UseBreakeven      = true;       // ブレイクイーブン使用
+input double   BE_ActivateRR     = 1.0;        // 含み益がSL幅×この倍率でBE発動
+input double   BE_LockPips       = 0.50;       // BE時にエントリー価格+この$分をロック
+input bool     UseTrailingStop   = true;        // トレーリングストップ使用
+input double   TrailActivateRR   = 1.5;        // 含み益がSL幅×この倍率でトレーリング開始
 input double   TrailATR_Multi    = 1.5;        // トレーリング幅 = ATR × 倍率
-input double   TrailActivateRR   = 1.0;        // 含み益がSL幅×この倍率に達したら開始
 
 //--- 時間フィルター（サーバー時間）
 input bool     UseTimeFilter     = true;       // 時間フィルター使用
-input int      TradeStartHour    = 8;          // 取引開始時（ロンドン〜NY）
-input int      TradeEndHour      = 21;         // 取引終了時
+input int      TradeStartHour    = 10;         // 取引開始時（ロンドン市場〜）
+input int      TradeEndHour      = 20;         // 取引終了時（NY午後前）
 
 //--- その他
-input int      MaxSpreadPoints   = 500;        // 最大スプレッド（ポイント）※XAUUSD標準: 200-400
+input int      MaxSpreadPoints   = 500;        // 最大スプレッド（ポイント）
 input int      MagicNumber       = 20240101;   // マジックナンバー
 input string   TradeComment      = "GoldTrend"; // コメント
 
@@ -76,9 +82,9 @@ double         bufSlowEMA[];
 double         bufTrendEMA[];
 double         bufRSI[];
 double         bufATR[];
-double         bufADX[];       // ADXメインライン
-double         bufPlusDI[];    // +DI
-double         bufMinusDI[];   // -DI
+double         bufADX[];
+double         bufPlusDI[];
+double         bufMinusDI[];
 
 datetime       lastBarTime = 0;
 
@@ -87,13 +93,13 @@ datetime       lastBarTime = 0;
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   //--- インジケータハンドル作成
-   handleFastEMA  = iMA(_Symbol, PERIOD_CURRENT, FastEMA_Period, 0, MODE_EMA, PRICE_CLOSE);
-   handleSlowEMA  = iMA(_Symbol, PERIOD_CURRENT, SlowEMA_Period, 0, MODE_EMA, PRICE_CLOSE);
-   handleTrendEMA = iMA(_Symbol, PERIOD_CURRENT, TrendEMA_Period, 0, MODE_EMA, PRICE_CLOSE);
-   handleRSI      = iRSI(_Symbol, PERIOD_CURRENT, RSI_Period, PRICE_CLOSE);
-   handleATR      = iATR(_Symbol, PERIOD_CURRENT, ATR_Period);
-   handleADX      = iADX(_Symbol, PERIOD_CURRENT, ADX_Period);
+   //--- インジケータハンドル作成（SignalTFベース）
+   handleFastEMA  = iMA(_Symbol, SignalTF, FastEMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+   handleSlowEMA  = iMA(_Symbol, SignalTF, SlowEMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+   handleTrendEMA = iMA(_Symbol, SignalTF, TrendEMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+   handleRSI      = iRSI(_Symbol, SignalTF, RSI_Period, PRICE_CLOSE);
+   handleATR      = iATR(_Symbol, SignalTF, ATR_Period);
+   handleADX      = iADX(_Symbol, SignalTF, ADX_Period);
 
    if(handleFastEMA == INVALID_HANDLE || handleSlowEMA == INVALID_HANDLE ||
       handleTrendEMA == INVALID_HANDLE || handleRSI == INVALID_HANDLE ||
@@ -118,10 +124,12 @@ int OnInit()
    trade.SetDeviationInPoints(10);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
 
-   Print("GoldTrendEA v2.00 初期化完了");
+   Print("GoldTrendEA v3.00 初期化完了 (SignalTF=", EnumToString(SignalTF), ")");
    Print("口座残高: ", AccountInfoDouble(ACCOUNT_BALANCE), " ", AccountInfoString(ACCOUNT_CURRENCY));
+   Print("口座有効証拠金: ", AccountInfoDouble(ACCOUNT_EQUITY));
    Print("現在のリスク率: ", GetCurrentRiskPercent(), "%");
-   Print("ADXフィルター: ", ADX_MinLevel, " / SL倍率: ", ATR_SL_Multi, " / Trail倍率: ", TrailATR_Multi);
+   Print("ADX>=", ADX_MinLevel, " SL=", ATR_SL_Multi, "ATR RR=", RR_Ratio,
+         " Trail=", TrailATR_Multi, "ATR BE=", BE_ActivateRR, "R");
 
    return INIT_SUCCEEDED;
 }
@@ -146,15 +154,14 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   //--- 新しい足が確定した時のみ処理（M15の足確定時）
-   datetime currentBarTime = iTime(_Symbol, PERIOD_CURRENT, 0);
+   //--- ブレイクイーブン・トレーリングは毎ティック処理
+   if(UseBreakeven || UseTrailingStop)
+      ManageOpenPositions();
+
+   //--- SignalTFの新しい足が確定した時のみシグナル判定
+   datetime currentBarTime = iTime(_Symbol, SignalTF, 0);
    if(currentBarTime == lastBarTime)
-   {
-      //--- トレーリングストップは毎ティック処理
-      if(UseTrailingStop)
-         ManageTrailingStop();
       return;
-   }
    lastBarTime = currentBarTime;
 
    //--- インジケータデータ取得
@@ -168,21 +175,16 @@ void OnTick()
    //--- スプレッドチェック
    long spread = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
    if(spread > MaxSpreadPoints)
-   {
-      Print("スプレッドが広すぎます: ", spread, " points");
       return;
-   }
 
    //--- 既存ポジションの確認
-   bool hasPosition = HasOpenPosition();
+   if(HasOpenPosition())
+      return;
 
    //--- エントリーシグナル判定
-   if(!hasPosition)
-   {
-      int signal = GetTradeSignal();
-      if(signal != 0)
-         ExecuteTrade(signal);
-   }
+   int signal = GetTradeSignal();
+   if(signal != 0)
+      ExecuteTrade(signal);
 }
 
 //+------------------------------------------------------------------+
@@ -233,18 +235,19 @@ int GetTradeSignal()
    double adx           = bufADX[1];
    double plusDI         = bufPlusDI[1];
    double minusDI       = bufMinusDI[1];
-   double closePrice    = iClose(_Symbol, PERIOD_CURRENT, 1);
+   double closePrice    = iClose(_Symbol, SignalTF, 1);
 
    //--- ADXフィルター：トレンドが十分に強い場合のみエントリー
    if(adx < ADX_MinLevel)
       return 0;
 
+   //--- EMAの乖離率チェック（クロス直後のみ、乖離しすぎは見送り）
+   double emaDiff = MathAbs(fastEMA_curr - slowEMA_curr);
+   double atr = bufATR[1];
+   if(atr > 0 && emaDiff > atr * 1.0)
+      return 0;  // EMA乖離が大きすぎ = 既にトレンド進行中、遅いエントリー回避
+
    //--- 買いシグナル条件
-   //    1. 短期EMAが長期EMAを上抜け（ゴールデンクロス）
-   //    2. 価格が200EMAの上（上昇トレンド）
-   //    3. RSIが過買い圏に入っていない
-   //    4. ADXが閾値以上（トレンド強度確認）
-   //    5. +DIが-DIより上（買い方向のトレンド確認）
    bool buySignal = (fastEMA_prev <= slowEMA_prev) &&
                     (fastEMA_curr > slowEMA_curr) &&
                     (closePrice > trendEMA) &&
@@ -252,11 +255,6 @@ int GetTradeSignal()
                     (plusDI > minusDI);
 
    //--- 売りシグナル条件
-   //    1. 短期EMAが長期EMAを下抜け（デッドクロス）
-   //    2. 価格が200EMAの下（下降トレンド）
-   //    3. RSIが過売り圏に入っていない
-   //    4. ADXが閾値以上（トレンド強度確認）
-   //    5. -DIが+DIより上（売り方向のトレンド確認）
    bool sellSignal = (fastEMA_prev >= slowEMA_prev) &&
                      (fastEMA_curr < slowEMA_curr) &&
                      (closePrice < trendEMA) &&
@@ -265,12 +263,20 @@ int GetTradeSignal()
 
    if(buySignal)
    {
-      Print("買いシグナル検出: ADX=", adx, " +DI=", plusDI, " -DI=", minusDI, " RSI=", rsi);
+      Print("買いシグナル: ADX=", NormalizeDouble(adx,1),
+            " +DI=", NormalizeDouble(plusDI,1),
+            " -DI=", NormalizeDouble(minusDI,1),
+            " RSI=", NormalizeDouble(rsi,1),
+            " EMA乖離=", NormalizeDouble(emaDiff,2));
       return +1;
    }
    if(sellSignal)
    {
-      Print("売りシグナル検出: ADX=", adx, " +DI=", plusDI, " -DI=", minusDI, " RSI=", rsi);
+      Print("売りシグナル: ADX=", NormalizeDouble(adx,1),
+            " +DI=", NormalizeDouble(plusDI,1),
+            " -DI=", NormalizeDouble(minusDI,1),
+            " RSI=", NormalizeDouble(rsi,1),
+            " EMA乖離=", NormalizeDouble(emaDiff,2));
       return -1;
    }
 
@@ -278,29 +284,30 @@ int GetTradeSignal()
 }
 
 //+------------------------------------------------------------------+
-//| 段階的リスク率の取得                                                |
+//| 段階的リスク率の取得（有効証拠金ベースで複利）                        |
 //+------------------------------------------------------------------+
 double GetCurrentRiskPercent()
 {
-   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
 
-   if(balance >= Balance_Thresh4) return Risk_Level4;
-   if(balance >= Balance_Thresh3) return Risk_Level3;
-   if(balance >= Balance_Thresh2) return Risk_Level2;
+   if(equity >= Balance_Thresh4) return Risk_Level4;
+   if(equity >= Balance_Thresh3) return Risk_Level3;
+   if(equity >= Balance_Thresh2) return Risk_Level2;
 
    return Risk_Level1;
 }
 
 //+------------------------------------------------------------------+
-//| ロットサイズ計算（リスクベース）                                      |
+//| ロットサイズ計算（有効証拠金ベース複利）                              |
 //+------------------------------------------------------------------+
 double CalculateLotSize(double slDistance)
 {
    if(slDistance <= 0) return MinLot;
 
-   double balance    = AccountInfoDouble(ACCOUNT_BALANCE);
+   //--- 有効証拠金（エクイティ）ベースで複利効果を実現
+   double equity     = AccountInfoDouble(ACCOUNT_EQUITY);
    double riskPct    = GetCurrentRiskPercent() / 100.0;
-   double riskAmount = balance * riskPct;
+   double riskAmount = equity * riskPct;
 
    //--- 1ロットあたりの1ポイント価値を取得
    double tickValue  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
@@ -308,7 +315,6 @@ double CalculateLotSize(double slDistance)
 
    if(tickValue <= 0 || tickSize <= 0) return MinLot;
 
-   //--- slDistanceは価格差（ドル単位）
    //--- SL幅をtick数に変換してからtickValueで金額化
    double slTicks    = slDistance / tickSize;
    double lossPerLot = slTicks * tickValue;
@@ -319,17 +325,16 @@ double CalculateLotSize(double slDistance)
 
    //--- ロットサイズを正規化
    double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(lotStep <= 0) lotStep = 0.01;
    lots = MathFloor(lots / lotStep) * lotStep;
 
-   //--- 範囲内に制限
-   lots = MathMax(lots, MinLot);
-   lots = MathMin(lots, MaxLot);
-
-   //--- ブローカーの制限もチェック
+   //--- ブローカーの制限チェック
    double brokerMinLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double brokerMaxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   lots = MathMax(lots, brokerMinLot);
-   lots = MathMin(lots, brokerMaxLot);
+
+   //--- 範囲内に制限
+   lots = MathMax(lots, MathMax(MinLot, brokerMinLot));
+   lots = MathMin(lots, MathMin(MaxLot, brokerMaxLot));
 
    //--- 証拠金チェック
    double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
@@ -348,11 +353,16 @@ double CalculateLotSize(double slDistance)
             return 0;
          }
 
-         Print("証拠金制限によりロット縮小: ", lots, " -> ", safeLots,
-               " (必要証拠金=", marginRequired, " 余剰=", freeMargin, ")");
+         Print("証拠金制限: ", lots, " -> ", safeLots);
          lots = safeLots;
       }
    }
+
+   Print("ロット計算: Equity=", NormalizeDouble(equity,2),
+         " Risk=", GetCurrentRiskPercent(), "%",
+         " RiskAmt=", NormalizeDouble(riskAmount,2),
+         " SL$=", NormalizeDouble(slDistance,2),
+         " Lots=", lots);
 
    return lots;
 }
@@ -371,7 +381,6 @@ void ExecuteTrade(int signal)
 
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
    int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
 
    double slDistance = NormalizeDouble(atr * ATR_SL_Multi, digits);
@@ -392,12 +401,11 @@ void ExecuteTrade(int signal)
       double tp = NormalizeDouble(entryPrice + tpDistance, digits);
 
       Print("買いエントリー: Price=", entryPrice, " SL=", sl, " TP=", tp,
-            " Lots=", lots, " ATR=", atr, " Risk=", GetCurrentRiskPercent(), "%");
+            " SL幅=", slDistance, " TP幅=", tpDistance,
+            " Lots=", lots, " ATR=", atr);
 
       if(!trade.Buy(lots, _Symbol, entryPrice, sl, tp, TradeComment))
-      {
          Print("買い注文失敗: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
-      }
    }
    else if(signal == -1) // 売り
    {
@@ -406,12 +414,11 @@ void ExecuteTrade(int signal)
       double tp = NormalizeDouble(entryPrice - tpDistance, digits);
 
       Print("売りエントリー: Price=", entryPrice, " SL=", sl, " TP=", tp,
-            " Lots=", lots, " ATR=", atr, " Risk=", GetCurrentRiskPercent(), "%");
+            " SL幅=", slDistance, " TP幅=", tpDistance,
+            " Lots=", lots, " ATR=", atr);
 
       if(!trade.Sell(lots, _Symbol, entryPrice, sl, tp, TradeComment))
-      {
          Print("売り注文失敗: ", trade.ResultRetcode(), " - ", trade.ResultRetcodeDescription());
-      }
    }
 }
 
@@ -435,18 +442,21 @@ bool HasOpenPosition()
 }
 
 //+------------------------------------------------------------------+
-//| トレーリングストップ管理（含み益が一定以上で開始）                      |
+//| ポジション管理（ブレイクイーブン＋トレーリング）                       |
 //+------------------------------------------------------------------+
-void ManageTrailingStop()
+void ManageOpenPositions()
 {
-   //--- ATRデータが必要
+   //--- ATRデータ取得
    double atrBuf[];
    ArraySetAsSeries(atrBuf, true);
    if(CopyBuffer(handleATR, 0, 0, 2, atrBuf) < 2) return;
    if(atrBuf[1] <= 0) return;
 
-   double trailDistance = atrBuf[1] * TrailATR_Multi;
-   double activateDistance = atrBuf[1] * ATR_SL_Multi * TrailActivateRR;
+   double currentATR = atrBuf[1];
+   double slWidth = currentATR * ATR_SL_Multi;
+   double trailDistance = currentATR * TrailATR_Multi;
+   double beActivate = slWidth * BE_ActivateRR;
+   double trailActivate = slWidth * TrailActivateRR;
    int    digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
@@ -457,7 +467,7 @@ void ManageTrailingStop()
       if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
       if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
 
-      long posType    = PositionGetInteger(POSITION_TYPE);
+      long posType     = PositionGetInteger(POSITION_TYPE);
       double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
       double currentSL = PositionGetDouble(POSITION_SL);
       double currentTP = PositionGetDouble(POSITION_TP);
@@ -467,17 +477,28 @@ void ManageTrailingStop()
          double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
          double profit = bid - openPrice;
 
-         //--- 含み益がactivateDistance以上になったらトレーリング開始
-         if(profit < activateDistance) continue;
-
-         double newSL = NormalizeDouble(bid - trailDistance, digits);
-
-         //--- 新SLが現SLより高い場合のみ移動（SLは常に上方向へ）
-         if(newSL > currentSL && newSL >= openPrice)
+         //--- Phase 1: ブレイクイーブン（含み益が1R以上でSLをエントリー+α に移動）
+         if(UseBreakeven && profit >= beActivate)
          {
-            if(!trade.PositionModify(ticket, newSL, currentTP))
+            double beSL = NormalizeDouble(openPrice + BE_LockPips, digits);
+            if(currentSL < beSL)
             {
-               Print("トレーリング（買い）失敗: ", trade.ResultRetcode());
+               if(trade.PositionModify(ticket, beSL, currentTP))
+               {
+                  Print("BE発動（買い）: SL -> ", beSL, " (含み益=", NormalizeDouble(profit,2), ")");
+                  currentSL = beSL;  // 更新して次のチェックへ
+               }
+            }
+         }
+
+         //--- Phase 2: トレーリング（含み益が1.5R以上でATRベーストレーリング）
+         if(UseTrailingStop && profit >= trailActivate)
+         {
+            double newSL = NormalizeDouble(bid - trailDistance, digits);
+            if(newSL > currentSL)
+            {
+               if(!trade.PositionModify(ticket, newSL, currentTP))
+                  Print("トレーリング（買い）失敗: ", trade.ResultRetcode());
             }
          }
       }
@@ -486,17 +507,28 @@ void ManageTrailingStop()
          double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
          double profit = openPrice - ask;
 
-         //--- 含み益がactivateDistance以上になったらトレーリング開始
-         if(profit < activateDistance) continue;
-
-         double newSL = NormalizeDouble(ask + trailDistance, digits);
-
-         //--- 新SLが現SLより低い場合のみ移動（SLは常に下方向へ）
-         if((currentSL == 0 || newSL < currentSL) && newSL <= openPrice)
+         //--- Phase 1: ブレイクイーブン
+         if(UseBreakeven && profit >= beActivate)
          {
-            if(!trade.PositionModify(ticket, newSL, currentTP))
+            double beSL = NormalizeDouble(openPrice - BE_LockPips, digits);
+            if(currentSL == 0 || currentSL > beSL)
             {
-               Print("トレーリング（売り）失敗: ", trade.ResultRetcode());
+               if(trade.PositionModify(ticket, beSL, currentTP))
+               {
+                  Print("BE発動（売り）: SL -> ", beSL, " (含み益=", NormalizeDouble(profit,2), ")");
+                  currentSL = beSL;
+               }
+            }
+         }
+
+         //--- Phase 2: トレーリング
+         if(UseTrailingStop && profit >= trailActivate)
+         {
+            double newSL = NormalizeDouble(ask + trailDistance, digits);
+            if(currentSL == 0 || newSL < currentSL)
+            {
+               if(!trade.PositionModify(ticket, newSL, currentTP))
+                  Print("トレーリング（売り）失敗: ", trade.ResultRetcode());
             }
          }
       }
