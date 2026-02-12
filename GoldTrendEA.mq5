@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
 //|                                                  GoldTrendEA.mq5 |
 //|                        Gold Mean Reversion EA for Exness MT5      |
-//|                        XAUUSD M15 - v6.00 Enhanced Pullback       |
+//|                        XAUUSD M15 - v6.10 Optimized Pullback      |
 //+------------------------------------------------------------------+
 #property copyright "GoldTrendEA"
-#property version   "6.00"
+#property version   "6.10"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -13,18 +13,13 @@
 //| Input Parameters                                                  |
 //+------------------------------------------------------------------+
 
-//--- トレンド判定（大きな方向性のみ）
-input int      TrendEMA_Period   = 200;        // トレンド判定EMA期間
+//--- トレンド判定（v6.10: EMA100に短縮してトレンド検出を高速化）
+input int      TrendEMA_Period   = 100;        // トレンド判定EMA期間（v6:200→100）
 
 //--- RSIプルバック検出（v6: 閾値を緩和して取引機会を増加）
 input int      RSI_Period        = 14;         // RSI期間
-input double   RSI_OversoldLevel = 35.0;       // 売られすぎ水準（v5:30→v6:35で機会増）
-input double   RSI_OverboughtLevel = 65.0;     // 買われすぎ水準（v5:70→v6:65で機会増）
-
-//--- ADXトレンド強度フィルター（v6新規）
-input int      ADX_Period        = 14;         // ADX期間
-input double   ADX_MinLevel      = 20.0;       // 最低ADX値（トレンド確認）
-input double   ADX_StrongLevel   = 30.0;       // 強トレンドADX閾値（ショート条件強化）
+input double   RSI_OversoldLevel = 35.0;       // 売られすぎ水準
+input double   RSI_OverboughtLevel = 65.0;     // 買われすぎ水準
 
 //--- ATRベース損切り・利確
 input int      ATR_Period        = 14;         // ATR期間
@@ -44,16 +39,17 @@ input double   Balance_Thresh4   = 300000.0;   // レベル4閾値（円）
 input double   MinLot            = 0.01;       // 最小ロット
 input double   MaxLot            = 10.0;       // 最大ロット
 
-//--- ブレイクイーブン＆トレーリング（v6: トレーリング追加）
+//--- ブレイクイーブン＆トレーリング
 input bool     UseBreakeven      = true;       // ブレイクイーブン使用
 input double   BE_ActivateRR     = 0.8;        // 含み益がSL幅×この倍率でBE発動
 input double   BE_LockPips       = 0.20;       // BE時にエントリー+この$分を確保
-input bool     UseTrailing       = true;        // トレーリングストップ使用（v6新規）
+input bool     UseTrailing       = true;        // トレーリングストップ使用
 input double   Trail_ActivateRR  = 1.0;        // 含み益がSL幅×この倍率でトレーリング開始
 input double   Trail_StepRR      = 0.3;        // SL幅×この倍率ずつSLを引き上げ
 
-//--- ポジション管理（v6新規）
+//--- ポジション管理
 input int      MaxPositions      = 2;          // 同時最大ポジション数
+input int      CooldownBars      = 4;          // エントリー後の最小待機足数（v6.10新規）
 
 //--- 時間フィルター（サーバー時間）
 input bool     UseTimeFilter     = true;       // 時間フィルター使用
@@ -72,16 +68,13 @@ CTrade         trade;
 int            handleTrendEMA;
 int            handleRSI;
 int            handleATR;
-int            handleADX;
 
 double         bufTrendEMA[];
 double         bufRSI[];
 double         bufATR[];
-double         bufADX[];        // ADXメインライン
-double         bufPlusDI[];     // +DI
-double         bufMinusDI[];    // -DI
 
 datetime       lastBarTime = 0;
+datetime       lastEntryTime = 0;   // 最後のエントリー時刻
 
 //+------------------------------------------------------------------+
 //| Expert initialization function                                     |
@@ -91,10 +84,9 @@ int OnInit()
    handleTrendEMA = iMA(_Symbol, PERIOD_CURRENT, TrendEMA_Period, 0, MODE_EMA, PRICE_CLOSE);
    handleRSI      = iRSI(_Symbol, PERIOD_CURRENT, RSI_Period, PRICE_CLOSE);
    handleATR      = iATR(_Symbol, PERIOD_CURRENT, ATR_Period);
-   handleADX      = iADX(_Symbol, PERIOD_CURRENT, ADX_Period);
 
    if(handleTrendEMA == INVALID_HANDLE || handleRSI == INVALID_HANDLE ||
-      handleATR == INVALID_HANDLE || handleADX == INVALID_HANDLE)
+      handleATR == INVALID_HANDLE)
    {
       Print("インジケータの初期化に失敗しました");
       return INIT_FAILED;
@@ -103,16 +95,13 @@ int OnInit()
    ArraySetAsSeries(bufTrendEMA, true);
    ArraySetAsSeries(bufRSI, true);
    ArraySetAsSeries(bufATR, true);
-   ArraySetAsSeries(bufADX, true);
-   ArraySetAsSeries(bufPlusDI, true);
-   ArraySetAsSeries(bufMinusDI, true);
 
    trade.SetExpertMagicNumber(MagicNumber);
    trade.SetDeviationInPoints(10);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
 
-   Print("GoldTrendEA v6.00 Enhanced Mean Reversion 初期化完了");
-   Print("戦略: トレンド内の押し目/戻り売り + ADXフィルター + トレーリング");
+   Print("GoldTrendEA v6.10 Optimized Mean Reversion 初期化完了");
+   Print("戦略: EMA", TrendEMA_Period, " + RSI押し目/戻り + ローソク足確認 + トレーリング");
    Print("エクイティ: ", AccountInfoDouble(ACCOUNT_EQUITY), " ", AccountInfoString(ACCOUNT_CURRENCY));
    Print("リスク率: ", GetCurrentRiskPercent(), "%");
 
@@ -127,7 +116,6 @@ void OnDeinit(const int reason)
    if(handleTrendEMA != INVALID_HANDLE) IndicatorRelease(handleTrendEMA);
    if(handleRSI      != INVALID_HANDLE) IndicatorRelease(handleRSI);
    if(handleATR      != INVALID_HANDLE) IndicatorRelease(handleATR);
-   if(handleADX      != INVALID_HANDLE) IndicatorRelease(handleADX);
 
    Print("GoldTrendEA 終了");
 }
@@ -160,15 +148,26 @@ void OnTick()
    if(spread > MaxSpreadPoints)
       return;
 
-   //--- ポジション数チェック（v6: 最大数まで許可）
+   //--- ポジション数チェック
    int posCount = CountOpenPositions();
    if(posCount >= MaxPositions)
       return;
 
+   //--- クールダウンチェック（直前エントリーからN足待つ）
+   if(lastEntryTime > 0)
+   {
+      int barsSinceEntry = iBarShift(_Symbol, PERIOD_CURRENT, lastEntryTime, false);
+      if(barsSinceEntry < CooldownBars)
+         return;
+   }
+
    //--- エントリーシグナル判定
    int signal = GetTradeSignal();
    if(signal != 0)
+   {
       ExecuteTrade(signal);
+      lastEntryTime = TimeCurrent();
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -194,72 +193,61 @@ bool GetIndicatorData()
    if(CopyBuffer(handleTrendEMA, 0, 0, 3, bufTrendEMA) < 3)  return false;
    if(CopyBuffer(handleRSI, 0, 0, 3, bufRSI) < 3)            return false;
    if(CopyBuffer(handleATR, 0, 0, 3, bufATR) < 3)            return false;
-   if(CopyBuffer(handleADX, 0, 0, 3, bufADX) < 3)            return false;
-   if(CopyBuffer(handleADX, 1, 0, 3, bufPlusDI) < 3)         return false;
-   if(CopyBuffer(handleADX, 2, 0, 3, bufMinusDI) < 3)        return false;
 
    return true;
 }
 
 //+------------------------------------------------------------------+
-//| 売買シグナル判定（v6: ADXフィルター追加）                             |
+//| 売買シグナル判定（v6.10: ADX撤去、ローソク足方向確認に変更）          |
 //|                                                                    |
-//| 変更点:                                                            |
-//|   - RSI閾値を緩和（30/70→35/65）で取引機会増加                      |
-//|   - ADX≧20でトレンド存在を確認                                      |
-//|   - ショートはADX≧30の強トレンドのみ（弱い戻り売りを除外）           |
-//|   - DI方向でトレンド方向を二重確認                                   |
+//| v6.00からの変更点:                                                  |
+//|   - ADXフィルター撤去（押し目でADX低下→シグナル潰しの問題解消）       |
+//|   - EMA100でトレンド検出を高速化                                     |
+//|   - ローソク足の方向で反転確認（軽量フィルター）                       |
+//|     買い: 確定足が陽線（close > open）= 反発の兆候                    |
+//|     売り: 確定足が陰線（close < open）= 反落の兆候                    |
 //+------------------------------------------------------------------+
 int GetTradeSignal()
 {
    //--- 確定足データ（[1]=直前確定足, [2]=その前の足）
    double closePrice  = iClose(_Symbol, PERIOD_CURRENT, 1);
+   double openPrice   = iOpen(_Symbol, PERIOD_CURRENT, 1);
    double trendEMA    = bufTrendEMA[1];
    double rsi_curr    = bufRSI[1];
    double rsi_prev    = bufRSI[2];
-   double adx         = bufADX[1];
-   double plusDI       = bufPlusDI[1];
-   double minusDI      = bufMinusDI[1];
-
-   //--- ADXフィルター: トレンドが存在するか
-   if(adx < ADX_MinLevel)
-      return 0;
 
    //--- 買いシグナル: 上昇トレンド中の押し目買い
-   //    1. 価格がEMA200の上（上昇トレンド）
-   //    2. ADX≧20（トレンド存在）+ +DI > -DI（上昇方向確認）
-   //    3. RSIが売られすぎから回復
+   //    1. 価格がEMA100の上（上昇トレンド）
+   //    2. RSIが売られすぎから回復（35以下→35超え）
+   //    3. 確定足が陽線（反発確認）
    bool buySignal = (closePrice > trendEMA) &&
-                    (plusDI > minusDI) &&
                     (rsi_prev <= RSI_OversoldLevel) &&
-                    (rsi_curr > RSI_OversoldLevel);
+                    (rsi_curr > RSI_OversoldLevel) &&
+                    (closePrice > openPrice);
 
    //--- 売りシグナル: 下降トレンド中の戻り売り
-   //    1. 価格がEMA200の下（下降トレンド）
-   //    2. ADX≧30（強トレンドのみ）+ -DI > +DI（下降方向確認）
-   //    3. RSIが買われすぎから下落
+   //    1. 価格がEMA100の下（下降トレンド）
+   //    2. RSIが買われすぎから下落（65以上→65未満）
+   //    3. 確定足が陰線（反落確認）
    bool sellSignal = (closePrice < trendEMA) &&
-                     (adx >= ADX_StrongLevel) &&
-                     (minusDI > plusDI) &&
                      (rsi_prev >= RSI_OverboughtLevel) &&
-                     (rsi_curr < RSI_OverboughtLevel);
+                     (rsi_curr < RSI_OverboughtLevel) &&
+                     (closePrice < openPrice);
 
    if(buySignal)
    {
       Print("押し目買いシグナル: RSI ", NormalizeDouble(rsi_prev,1),
             " -> ", NormalizeDouble(rsi_curr,1),
-            " ADX=", NormalizeDouble(adx,1),
-            " +DI=", NormalizeDouble(plusDI,1), " -DI=", NormalizeDouble(minusDI,1),
-            " Price=", closePrice, " EMA200=", NormalizeDouble(trendEMA,2));
+            " Candle=陽線",
+            " Price=", closePrice, " EMA", TrendEMA_Period, "=", NormalizeDouble(trendEMA,2));
       return +1;
    }
    if(sellSignal)
    {
       Print("戻り売りシグナル: RSI ", NormalizeDouble(rsi_prev,1),
             " -> ", NormalizeDouble(rsi_curr,1),
-            " ADX=", NormalizeDouble(adx,1),
-            " +DI=", NormalizeDouble(plusDI,1), " -DI=", NormalizeDouble(minusDI,1),
-            " Price=", closePrice, " EMA200=", NormalizeDouble(trendEMA,2));
+            " Candle=陰線",
+            " Price=", closePrice, " EMA", TrendEMA_Period, "=", NormalizeDouble(trendEMA,2));
       return -1;
    }
 
@@ -401,20 +389,7 @@ int CountOpenPositions()
 }
 
 //+------------------------------------------------------------------+
-//| 自分のポジションがあるか確認                                         |
-//+------------------------------------------------------------------+
-bool HasOpenPosition()
-{
-   return (CountOpenPositions() > 0);
-}
-
-//+------------------------------------------------------------------+
-//| ストップロス管理（v6: BE + トレーリング統合）                        |
-//|                                                                    |
-//| 動作:                                                              |
-//|   含み益 ≧ SL幅×0.8 → ブレイクイーブンに移動                       |
-//|   含み益 ≧ SL幅×1.0 → 以降SL幅×0.3ずつトレーリング                 |
-//|   → 大きなトレンドの利益を逃さない                                  |
+//| ストップロス管理（BE + トレーリング統合）                            |
 //+------------------------------------------------------------------+
 void ManageStopLoss()
 {
@@ -451,7 +426,6 @@ void ManageStopLoss()
          if(UseTrailing && profit >= trailActivate)
          {
             double trailSL = NormalizeDouble(bid - trailStep, digits);
-            // 現在のSLより高い場合のみ更新
             if(trailSL > currentSL && trailSL > openPrice + BE_LockPips)
                trade.PositionModify(ticket, trailSL, currentTP);
          }
