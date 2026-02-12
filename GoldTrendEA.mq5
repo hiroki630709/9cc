@@ -46,7 +46,7 @@ input bool     UseTrailingStop   = true;       // トレーリングストップ
 input double   TrailATR_Multi    = 1.0;        // トレーリング幅 = ATR × 倍率
 
 //--- その他
-input int      MaxSpreadPoints   = 50;         // 最大スプレッド（ポイント）
+input int      MaxSpreadPoints   = 500;        // 最大スプレッド（ポイント）※XAUUSD標準: 200-400
 input int      MagicNumber       = 20240101;   // マジックナンバー
 input string   TradeComment      = "GoldTrend"; // コメント
 
@@ -268,6 +268,31 @@ double CalculateLotSize(double slDistance)
    lots = MathMax(lots, brokerMinLot);
    lots = MathMin(lots, brokerMaxLot);
 
+   //--- 証拠金チェック（レバレッジ100倍対応）
+   //--- 注文に必要な証拠金が余剰証拠金の80%を超えないようにする
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double marginRequired = 0;
+   if(OrderCalcMargin(ORDER_TYPE_BUY, _Symbol, lots, SymbolInfoDouble(_Symbol, SYMBOL_ASK), marginRequired))
+   {
+      if(marginRequired > freeMargin * 0.8)
+      {
+         //--- 余剰証拠金の80%以内に収まるロットに縮小
+         double safeLots = lots * (freeMargin * 0.8) / marginRequired;
+         safeLots = MathFloor(safeLots / lotStep) * lotStep;
+         safeLots = MathMax(safeLots, brokerMinLot);
+
+         if(safeLots < brokerMinLot)
+         {
+            Print("証拠金不足: 必要=", marginRequired, " 余剰=", freeMargin);
+            return 0;
+         }
+
+         Print("証拠金制限によりロット縮小: ", lots, " -> ", safeLots,
+               " (必要証拠金=", marginRequired, " 余剰=", freeMargin, ")");
+         lots = safeLots;
+      }
+   }
+
    return lots;
 }
 
@@ -292,6 +317,12 @@ void ExecuteTrade(int signal)
    double tpDistance = NormalizeDouble(slDistance * RR_Ratio, digits);
 
    double lots = CalculateLotSize(slDistance);
+
+   if(lots <= 0)
+   {
+      Print("ロットサイズ計算失敗（証拠金不足の可能性）");
+      return;
+   }
 
    if(signal == +1) // 買い
    {
